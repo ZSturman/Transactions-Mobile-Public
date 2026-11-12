@@ -1,0 +1,488 @@
+"use client";
+
+import { useState } from "react";
+import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import {
+  doc,
+  runTransaction,
+  serverTimestamp,
+  addDoc,
+  collection,
+  Timestamp,
+} from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { useAuth } from "@/contexts/AuthContext";
+import { usePairs } from "@/hooks/usePairs";
+import { useTransactions } from "@/hooks/useTransactions";
+import { Transaction } from "@/types";
+import { exportPairToCsv, exportPairToJson } from "@/utils/export";
+import {
+  approveTransaction,
+  disputeTransaction,
+  acceptCounter,
+  rejectCounter,
+  archiveTransaction,
+  unarchiveTransaction,
+  archiveResolvedForPair,
+  cancelTransaction,
+  editTransaction,
+  requestSettlement,
+  denySettlement,
+  removeConnection,
+  setAutoApprove,
+} from "@/utils/transactionActions";
+import BalanceSummary from "@/components/BalanceSummary";
+import TransactionForm from "@/components/TransactionForm";
+import TransactionList from "@/components/TransactionList";
+import TransactionTable from "@/components/TransactionTable";
+import BalanceTrendChart from "@/components/BalanceTrendChart";
+import SettleModal from "@/components/SettleModal";
+import ForgiveModal from "@/components/ForgiveModal";
+import PairOptionsMenu from "@/components/PairOptionsMenu";
+import CsvImportModal from "@/components/CsvImportModal";
+import ToggleSwitch from "@/components/ToggleSwitch";
+import { EditPendingTransactionValues } from "@/components/EditPendingTransactionForm";
+import toast from "react-hot-toast";
+
+type ViewMode = "cards" | "table";
+
+export default function PairDetailPage() {
+  const params = useParams<{ pairId: string }>();
+  const router = useRouter();
+  const pairId = params.pairId;
+  const { user } = useAuth();
+  const { pairs, loading: pairsLoading } = usePairs();
+  const [showArchived, setShowArchived] = useState(false);
+  const { transactions, loading: txLoading } = useTransactions(pairId, { includeArchived: showArchived });
+  const [showForm, setShowForm] = useState(false);
+  const [filter, setFilter] = useState<"all" | "pending" | "approved" | "disputed">("all");
+  const [viewMode, setViewMode] = useState<ViewMode>("cards");
+  const [showSettleModal, setShowSettleModal] = useState(false);
+  const [showForgiveModal, setShowForgiveModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
+
+  const pair = pairs.find((p) => p.id === pairId);
+
+  if (pairsLoading || txLoading) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600" />
+      </div>
+    );
+  }
+
+  if (!pair || !user) {
+    return (
+      <div className="text-center py-20">
+        <p className="text-gray-400">Balance not found</p>
+        <Link href="/" className="text-blue-600 text-sm hover:underline mt-2 inline-block">
+          Back to Dashboard
+        </Link>
+      </div>
+    );
+  }
+
+  const idx = pair.users.indexOf(user.uid);
+  const partnerName = pair.userNames[idx === 0 ? 1 : 0];
+  const partnerEmail = pair.userEmails[idx === 0 ? 1 : 0];
+  const userBalance = idx === 0 ? pair.balance : -pair.balance;
+  const isDeleted = pair.deletedUsers && Object.keys(pair.deletedUsers).some((uid) => uid !== user.uid);
+  const isActive = pair.status === "active";
+
+  const pendingCount = transactions.filter((t) => t.status === "pending" && t.createdBy !== user.uid).length;
+  const hasPendingTransactions = transactions.some((t) => t.status === "pending");
+  const hasPendingSettlement = transactions.some(
+    (t) => t.type === "settlement" && t.status === "pending"
+  );
+  const canRemoveConnection = isActive && pair.balance === 0 && !hasPendingTransactions;
+  const filteredTransactions = filter === "all" ? transactions : transactions.filter((t) => t.status === filter);
+
+  async function handleApprove(tx: Transaction) {
+    try {
+      await approveTransaction(pair!, tx, user!.uid);
+      toast.success(
+        tx.type === "settlement"
+          ? "Settlement approved — balance updated!"
+          : "Transaction approved — balance updated!"
+      );
+    } catch (err: any) {
+      toast.error(err.message || "Failed to approve");
+    }
+  }
+
+  async function handleDispute(tx: Transaction, reason: string, proposedAmount?: number) {
+    try {
+      await disputeTransaction(pair!, tx, user!.uid, reason, proposedAmount);
+      toast.success("Transaction disputed — creator notified");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to dispute");
+    }
+  }
+
+  async function handleDenySettlement(tx: Transaction) {
+    try {
+      await denySettlement(pair!, tx, user!.uid);
+      toast.success("Settlement request denied");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to deny settlement request");
+    }
+  }
+
+  async function handleAcceptCounter(tx: Transaction) {
+    try {
+      await acceptCounter(pair!, tx, user!.uid);
+      toast.success("Counter-proposal accepted!");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to accept counter");
+    }
+  }
+
+  async function handleRejectCounter(tx: Transaction) {
+    try {
+      await rejectCounter(pair!, tx);
+      toast.success("Counter-proposal rejected");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to reject counter");
+    }
+  }
+
+  async function handleSettle() {
+    try {
+      await requestSettlement(pair!, user!.uid);
+      setShowSettleModal(false);
+      toast.success("Settlement request sent — waiting for approval");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to request settlement");
+    }
+  }
+
+  async function handleForgive(amount: number, reason: string) {
+    try {
+      const newPairBalance = idx === 0 ? pair!.balance - amount : pair!.balance + amount;
+      let forgivenessTransactionId = "";
+
+      await runTransaction(db, async (transaction) => {
+        const pairRef = doc(db, "pairs", pair!.id);
+        const txRef = doc(collection(db, "pairs", pair!.id, "transactions"));
+        forgivenessTransactionId = txRef.id;
+
+        transaction.set(txRef, {
+          pairId: pair!.id,
+          amount,
+          type: "forgiveness",
+          description: reason || "Debt forgiven",
+          createdBy: user!.uid,
+          status: "approved",
+          createdAt: serverTimestamp(),
+          resolvedAt: serverTimestamp(),
+        });
+
+        transaction.update(pairRef, { balance: newPairBalance, updatedAt: serverTimestamp() });
+      });
+
+      await addDoc(collection(db, "pairs", pair!.id, "balanceSnapshots"), {
+        balance: newPairBalance,
+        timestamp: serverTimestamp(),
+        effectiveAt: Timestamp.now(),
+        transactionId: forgivenessTransactionId,
+        triggeredBy: user!.uid,
+        reason: `forgiven: ${reason || "no reason"}`,
+      });
+      setShowForgiveModal(false);
+      toast.success("Debt forgiven!");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to forgive");
+    }
+  }
+
+  function handleExport() {
+    exportPairToCsv(transactions, pair!, user!.uid);
+    toast.success("CSV downloaded");
+  }
+
+  function handleExportJson() {
+    exportPairToJson(transactions, pair!);
+    toast.success("JSON downloaded");
+  }
+
+  async function handleArchive(tx: Transaction) {
+    try {
+      await archiveTransaction(pair!.id, tx.id);
+      toast.success("Transaction archived");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to archive");
+    }
+  }
+
+  async function handleCancelTransaction(tx: Transaction) {
+    try {
+      await cancelTransaction(pair!.id, tx.id);
+      toast.success("Request cancelled");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to cancel request");
+    }
+  }
+
+  async function handleEditTransaction(tx: Transaction, values: EditPendingTransactionValues) {
+    try {
+      await editTransaction(pair!.id, tx.id, {
+        amount: values.amount,
+        description: values.description,
+        date: Timestamp.fromDate(new Date(values.date + "T12:00:00")),
+      });
+      toast.success("Transaction updated");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to update transaction");
+    }
+  }
+
+  async function handleToggleAutoApprove(enabled: boolean) {
+    try {
+      await setAutoApprove(pair!.id, enabled);
+      toast.success(
+        enabled
+          ? `Transactions with ${partnerName} will now be applied automatically`
+          : "Auto-approve turned off"
+      );
+    } catch (err: any) {
+      toast.error(err.message || "Failed to update auto-approve setting");
+    }
+  }
+
+  async function handleUnarchive(tx: Transaction) {
+    try {
+      await unarchiveTransaction(pair!.id, tx.id);
+      toast.success("Transaction restored");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to unarchive");
+    }
+  }
+
+  async function handleArchiveAllResolved() {
+    if (!confirm("Archive all approved transactions for this balance? You can restore them later from the archive view.")) return;
+    try {
+      const count = await archiveResolvedForPair(pair!.id, transactions);
+      if (count === 0) toast("Nothing to archive");
+      else toast.success(`Archived ${count} transaction${count === 1 ? "" : "s"}`);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to archive");
+    }
+  }
+
+  async function handleRemoveConnection() {
+    if (!confirm("Remove this connection for both people? Its transaction history will remain read-only.")) return;
+    try {
+      await removeConnection(pair!);
+      toast.success("Connection removed");
+      router.push("/");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to remove connection");
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Link href="/" className="text-sm text-gray-500 hover:text-blue-600 transition-colors">
+        ← Back to Dashboard
+      </Link>
+
+      {/* Partner header */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="truncate text-lg font-bold">
+            {isDeleted ? "[Deleted Account]" : partnerName}
+          </h1>
+          <p className="truncate text-xs text-gray-400">{partnerEmail}</p>
+        </div>
+        <div className="flex flex-shrink-0 items-center gap-2">
+          {pendingCount > 0 && (
+            <span className="bg-blue-100 text-blue-700 text-xs font-semibold px-2.5 py-1 rounded-full">
+              {pendingCount} pending
+            </span>
+          )}
+          {!isActive && (
+            <span className="bg-gray-100 text-gray-600 text-xs font-semibold px-2.5 py-1 rounded-full">
+              Connection removed
+            </span>
+          )}
+          <PairOptionsMenu
+            pair={pair}
+            onExport={handleExport}
+            onExportJson={handleExportJson}
+            onForgive={isActive ? () => setShowForgiveModal(true) : undefined}
+            onRemove={canRemoveConnection ? handleRemoveConnection : undefined}
+          />
+        </div>
+      </div>
+
+      {/* Balance summary */}
+      <div className="card">
+        <BalanceSummary pair={pair} transactions={transactions} />
+        {transactions.some((transaction) => transaction.status === "approved") && (
+          <div className="mt-4">
+            <BalanceTrendChart transactions={transactions} pair={pair} />
+          </div>
+        )}
+      </div>
+
+      {/* Auto-approve setting */}
+      {isActive && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-gray-200 bg-white px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-gray-700">Auto-approve transactions</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              New transactions with {partnerName} are applied immediately — neither of you needs to approve them.
+            </p>
+          </div>
+          <ToggleSwitch
+            checked={pair.autoApprove === true}
+            onChange={handleToggleAutoApprove}
+            label="Auto-approve transactions"
+          />
+        </div>
+      )}
+
+      {/* Settle button */}
+      {isActive && pair.balance !== 0 && !hasPendingSettlement && (
+        <button
+          onClick={() => setShowSettleModal(true)}
+          className="btn-secondary w-full text-sm"
+        >
+          Settle Balance
+        </button>
+      )}
+
+      {/* Archive resolved transactions when settled (balance is zero) */}
+      {isActive && pair.balance === 0 &&
+        transactions.some((t) => t.status === "approved") && (
+          <button
+            onClick={handleArchiveAllResolved}
+            className="btn-primary w-full text-sm"
+          >
+            Archive resolved transactions
+          </button>
+        )}
+
+      {/* Add transaction */}
+      {!isActive ? (
+        <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-500">
+          This connection has been removed. Its transaction history is read-only.
+        </div>
+      ) : showForm ? (
+        <TransactionForm pair={pair} onClose={() => setShowForm(false)} />
+      ) : (
+        <div className="flex gap-2">
+          <button onClick={() => setShowForm(true)} className="btn-primary flex-1 text-sm">
+            + Transaction
+          </button>
+          <button
+            onClick={() => setShowImportModal(true)}
+            className="btn-secondary text-sm px-4"
+            title="Import transactions from a CSV file"
+          >
+            Import CSV
+          </button>
+        </div>
+      )}
+
+      {/* Filter tabs + view toggle */}
+      <div className="space-y-2">
+        <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
+          {(["all", "pending", "approved", "disputed"] as const).map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`flex-1 text-xs font-medium py-1.5 rounded-md transition-colors capitalize ${
+                filter === f ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
+              }`}
+            >
+              {f}
+              {f === "pending" && pendingCount > 0 && (
+                <span className="ml-1 bg-blue-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">
+                  {pendingCount}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex justify-end gap-2 items-center">
+          <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+              className="rounded border-gray-300"
+            />
+            Show archived
+          </label>
+          <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
+            <button
+              onClick={() => setViewMode("cards")}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${viewMode === "cards" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
+            >
+              List
+            </button>
+            <button
+              onClick={() => setViewMode("table")}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${viewMode === "table" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
+            >
+              Table
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Transaction history */}
+      {viewMode === "cards" ? (
+        <TransactionList
+          transactions={filteredTransactions}
+          pair={pair}
+          onApprove={isActive ? handleApprove : undefined}
+          onDispute={isActive ? handleDispute : undefined}
+          onDenySettlement={isActive ? handleDenySettlement : undefined}
+          onAcceptCounter={isActive ? handleAcceptCounter : undefined}
+          onRejectCounter={isActive ? handleRejectCounter : undefined}
+          onArchive={isActive ? handleArchive : undefined}
+          onUnarchive={isActive ? handleUnarchive : undefined}
+          onCancel={isActive ? handleCancelTransaction : undefined}
+          onEdit={isActive ? handleEditTransaction : undefined}
+        />
+      ) : (
+        <TransactionTable
+          transactions={filteredTransactions.map((t) => ({ ...t, pairId: pair.id }))}
+          pairs={[pair]}
+          onApprove={isActive ? handleApprove : undefined}
+          onDenySettlement={isActive ? handleDenySettlement : undefined}
+          onArchive={isActive ? handleArchive : undefined}
+          onUnarchive={isActive ? handleUnarchive : undefined}
+        />
+      )}
+
+      {showSettleModal && (
+        <SettleModal
+          pair={pair}
+          onConfirm={handleSettle}
+          onClose={() => setShowSettleModal(false)}
+        />
+      )}
+
+      {showForgiveModal && (
+        <ForgiveModal
+          pair={pair}
+          onConfirm={handleForgive}
+          onClose={() => setShowForgiveModal(false)}
+        />
+      )}
+
+      {showImportModal && (
+        <CsvImportModal
+          pair={pair}
+          userId={user.uid}
+          onClose={() => setShowImportModal(false)}
+        />
+      )}
+    </div>
+  );
+}

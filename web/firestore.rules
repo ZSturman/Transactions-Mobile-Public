@@ -1,0 +1,263 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function notDeleting() {
+      return signedIn() && !exists(/databases/$(database)/documents/accountDeletionJobs/$(request.auth.uid));
+    }
+
+    function pairAvailable(pair) {
+      return !exists(/databases/$(database)/documents/accountDeletionJobs/$(pair.users[0]))
+        && (pair.users[1] == '' || !exists(/databases/$(database)/documents/accountDeletionJobs/$(pair.users[1])));
+    }
+
+    function isMember(pair) {
+      return signedIn() && request.auth.uid in pair.users;
+    }
+
+    function isActiveMember(pair) {
+      return isMember(pair) && pairAvailable(pair) && pair.status == 'active';
+    }
+
+    function isWritableMember(pair) {
+      return isMember(pair) && pairAvailable(pair) && pair.status in ['active', 'pending'];
+    }
+
+    function isActiveMemberAfter(pairId) {
+      return notDeleting()
+        && pairAvailable(getAfter(/databases/$(database)/documents/pairs/$(pairId)).data)
+        && getAfter(/databases/$(database)/documents/pairs/$(pairId)).data.status == 'active'
+        && request.auth.uid in getAfter(/databases/$(database)/documents/pairs/$(pairId)).data.users;
+    }
+
+    function isWritableMemberAfter(pairId) {
+      return notDeleting()
+        && pairAvailable(getAfter(/databases/$(database)/documents/pairs/$(pairId)).data)
+        && getAfter(/databases/$(database)/documents/pairs/$(pairId)).data.status in ['active', 'pending']
+        && request.auth.uid in getAfter(/databases/$(database)/documents/pairs/$(pairId)).data.users;
+    }
+
+    function inviteHasNotExpired(invite) {
+      // Existing invitations created before expirations were introduced remain
+      // usable; every new invitation must carry a short-lived expiresAt value.
+      return !invite.keys().hasAll(['expiresAt']) || request.time < invite.expiresAt;
+    }
+
+    function recipientCompletesPendingPair() {
+      return signedIn()
+        && resource.data.status == 'pending'
+        && request.auth.token.email == resource.data.userEmails[1]
+        && request.resource.data.status == 'active'
+        && request.resource.data.users[0] == resource.data.users[0]
+        && request.resource.data.users[1] == request.auth.uid
+        && request.resource.data.userEmails[0] == resource.data.userEmails[0]
+        && request.resource.data.userEmails[1] == request.auth.token.email
+        && request.resource.data.userNames[0] == resource.data.userNames[0]
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['users', 'userEmails', 'userNames', 'status', 'updatedAt']);
+    }
+
+    function memberUpdatesActivePair() {
+      return isActiveMember(resource.data)
+        && resource.data.status == 'active'
+        && request.resource.data.status == 'active'
+        && request.resource.data.users == resource.data.users
+        && request.resource.data.userEmails == resource.data.userEmails
+        && request.resource.data.userNames == resource.data.userNames
+        && request.resource.data.currency == resource.data.currency
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['balance', 'updatedAt', 'deletedUsers', 'autoApprove']);
+    }
+
+    function memberRemovesSettledPair() {
+      return isActiveMember(resource.data)
+        && resource.data.balance == 0
+        && request.resource.data.status == 'removed'
+        && request.resource.data.users == resource.data.users
+        && request.resource.data.userEmails == resource.data.userEmails
+        && request.resource.data.userNames == resource.data.userNames
+        && request.resource.data.currency == resource.data.currency
+        && request.resource.data.balance == resource.data.balance
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updatedAt']);
+    }
+
+    function memberMarksRemovedPairDeletion() {
+      return isMember(resource.data)
+        && resource.data.status == 'removed'
+        && request.resource.data.status == 'removed'
+        && request.resource.data.users == resource.data.users
+        && request.resource.data.userEmails == resource.data.userEmails
+        && request.resource.data.userNames == resource.data.userNames
+        && request.resource.data.currency == resource.data.currency
+        && request.resource.data.balance == resource.data.balance
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['deletedUsers']);
+    }
+
+    function preservesTransactionIdentity() {
+      return request.resource.data.pairId == resource.data.pairId
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.type == resource.data.type
+        && request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    function partnerResolvesPendingTransaction() {
+      return resource.data.status == 'pending'
+        && request.auth.uid != resource.data.createdBy
+        && request.resource.data.status in ['approved', 'disputed']
+        && (
+          resource.data.type != 'settlement'
+          || request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'resolvedAt'])
+        );
+    }
+
+    function creatorResolvesCounterProposal() {
+      return resource.data.status == 'disputed'
+        && request.auth.uid == resource.data.createdBy
+        && (
+          (
+            resource.data.proposedAmount != null
+            && request.resource.data.status == 'approved'
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['amount', 'status', 'resolvedAt'])
+          )
+          || (
+            request.resource.data.status == 'disputed'
+            && request.resource.data.proposedAmount == null
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['proposedAmount'])
+          )
+        );
+    }
+
+    function memberArchivesResolvedTransaction() {
+      return resource.data.status == 'approved'
+        && request.resource.data.status == 'approved'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['archived', 'archivedAt']);
+    }
+
+    function creatorEditsPendingTransaction() {
+      return resource.data.status == 'pending'
+        && request.auth.uid == resource.data.createdBy
+        && request.resource.data.status == 'pending'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['amount', 'description', 'date']);
+    }
+
+    // ─── Users ──────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create: if notDeleting() && (signedIn() && request.auth.uid == userId);
+      allow update: if notDeleting() && (signedIn() && request.auth.uid == userId);
+    }
+
+    // ─── Pairs ──────────────────────────────────────────
+    match /pairs/{pairId} {
+      allow read: if signedIn()
+        && (request.auth.uid in resource.data.users
+            || request.auth.token.email in resource.data.userEmails);
+
+      // A new pending pair has one authenticated sender and one empty slot.
+      allow create: if notDeleting() && (signedIn()
+        && request.auth.uid == request.resource.data.users[0]
+        && request.auth.token.email == request.resource.data.userEmails[0]
+        && request.resource.data.users[1] == ''
+        && request.resource.data.status == 'pending');
+
+      allow update: if notDeleting() && (recipientCompletesPendingPair()
+        || memberUpdatesActivePair()
+        || memberRemovesSettledPair()
+        || memberMarksRemovedPairDeletion());
+
+      allow delete: if notDeleting() && (signedIn()
+        && resource.data.status == 'pending'
+        && request.auth.uid == resource.data.users[0]);
+
+      match /transactions/{txId} {
+        allow read: if isMember(get(/databases/$(database)/documents/pairs/$(pairId)).data);
+
+        // getAfter permits the invitation acceptance transaction to activate a
+        // pair and create its queued transaction atomically.
+        allow create: if notDeleting() && (isWritableMemberAfter(pairId)
+          && request.resource.data.createdBy
+            in getAfter(/databases/$(database)/documents/pairs/$(pairId)).data.users
+          && request.resource.data.pairId == pairId
+          && (
+            request.resource.data.status == 'pending'
+            || (
+              request.resource.data.status == 'approved'
+              && request.resource.data.createdBy == request.auth.uid
+              && isActiveMemberAfter(pairId)
+              && (
+                request.resource.data.type == 'forgiveness'
+                || (
+                  request.resource.data.type in ['payment', 'request']
+                  && getAfter(/databases/$(database)/documents/pairs/$(pairId)).data.autoApprove == true
+                )
+              )
+            )
+          ));
+
+        allow update: if notDeleting() && (isActiveMember(get(/databases/$(database)/documents/pairs/$(pairId)).data)
+          && preservesTransactionIdentity()
+          && (
+            partnerResolvesPendingTransaction()
+            || creatorResolvesCounterProposal()
+            || memberArchivesResolvedTransaction()
+            || creatorEditsPendingTransaction()
+          ));
+
+        allow delete: if notDeleting() && (isWritableMember(get(/databases/$(database)/documents/pairs/$(pairId)).data)
+          && resource.data.createdBy == request.auth.uid
+          && resource.data.status == 'pending');
+      }
+
+      match /balanceSnapshots/{snapId} {
+        allow read: if isMember(get(/databases/$(database)/documents/pairs/$(pairId)).data);
+        allow create: if notDeleting() && (isActiveMember(getAfter(/databases/$(database)/documents/pairs/$(pairId)).data));
+      }
+    }
+
+    // ─── Invites ─────────────────────────────────────────
+    match /invites/{inviteId} {
+      allow read: if signedIn()
+        && (resource.data.fromUid == request.auth.uid
+            || resource.data.toEmail == request.auth.token.email);
+
+      // The pair and invitation are written together, binding the email in
+      // both records. The application sets an expiration no more than 8 days
+      // away (7 days in the UI) to tolerate small client clock differences.
+      allow create: if notDeleting() && (signedIn()
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.toEmail != request.auth.token.email
+        && request.resource.data.status == 'pending'
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt < request.time + duration.value(8, 'd')
+        && getAfter(/databases/$(database)/documents/pairs/$(request.resource.data.pairId)).data.users[0] == request.auth.uid
+        && getAfter(/databases/$(database)/documents/pairs/$(request.resource.data.pairId)).data.users[1] == ''
+        && getAfter(/databases/$(database)/documents/pairs/$(request.resource.data.pairId)).data.userEmails[1] == request.resource.data.toEmail
+        && getAfter(/databases/$(database)/documents/pairs/$(request.resource.data.pairId)).data.status == 'pending');
+
+      allow update: if notDeleting() && (signedIn()
+        && resource.data.status == 'pending'
+        && inviteHasNotExpired(resource.data)
+        && resource.data.toEmail == request.auth.token.email
+        && request.resource.data.status == 'accepted'
+        && request.resource.data.acceptedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'acceptedBy', 'acceptedAt']));
+
+      allow delete: if notDeleting() && (signedIn()
+        && resource.data.fromUid == request.auth.uid
+        && resource.data.status == 'pending');
+    }
+
+    // notificationDeliveries are server-only audit/idempotency records.
+  }
+}

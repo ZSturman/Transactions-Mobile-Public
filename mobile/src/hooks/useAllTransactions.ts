@@ -1,0 +1,90 @@
+import { useEffect, useState } from "react";
+import { collection, query, onSnapshot, orderBy } from "firebase/firestore";
+import { db } from "../lib/firebase";
+import { Pair, Transaction } from "../types";
+import { sortTransactionsByEventDate } from "../utils/transactionDate";
+
+export interface PairTransaction extends Transaction {
+  pairId: string;
+}
+
+export function useAllTransactions(
+  pairs: Pair[],
+  options: { includeArchived?: boolean; includePending?: boolean } = {},
+) {
+  const { includeArchived = false, includePending = false } = options;
+  const [transactions, setTransactions] = useState<PairTransaction[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const targetPairs = pairs.filter(
+      (p) =>
+        p.status === "active" || (includePending && p.status === "pending"),
+    );
+
+    if (targetPairs.length === 0) {
+      setTransactions([]);
+      setLoading(false);
+      return;
+    }
+
+    // Map from pairId → array of transactions
+    const txMap = new Map<string, PairTransaction[]>();
+    targetPairs.forEach((p) => txMap.set(p.id, []));
+
+    const waiting = new Set(targetPairs.map((pair) => pair.id));
+    setLoading(true);
+    setTransactions([]);
+
+    const unsubs = targetPairs.map((pair) => {
+      const q = query(
+        collection(db, "pairs", pair.id, "transactions"),
+        orderBy("createdAt", "desc"),
+      );
+
+      return onSnapshot(
+        q,
+        (snap) => {
+          const items = snap.docs
+            .map(
+              (d) =>
+                ({
+                  id: d.id,
+                  pairId: pair.id,
+                  ...d.data(),
+                }) as PairTransaction,
+            )
+            .filter((t) => includeArchived || t.archived !== true);
+
+          txMap.set(pair.id, items);
+
+          waiting.delete(pair.id);
+
+          if (waiting.size === 0) {
+            const all = sortTransactionsByEventDate(
+              Array.from(txMap.values()).flat(),
+            );
+            setTransactions(all);
+            setLoading(false);
+          }
+        },
+        (error) => {
+          console.error(
+            `Transactions listener error for pair ${pair.id}:`,
+            error,
+          );
+          waiting.delete(pair.id);
+          txMap.set(pair.id, []);
+          setTransactions(
+            sortTransactionsByEventDate(Array.from(txMap.values()).flat()),
+          );
+          if (waiting.size === 0) setLoading(false);
+        },
+      );
+    });
+
+    return () => unsubs.forEach((unsub) => unsub());
+  }, [pairs, includeArchived, includePending]);
+
+  return { transactions, loading };
+}
